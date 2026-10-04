@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ajax Voice</title>
+<!--
+  Interruptible voice chat with the OpenAI Realtime API, from a phone browser.
+
+  WHAT THIS IS
+
+  A single static page. It takes a short-lived session token (ek_...), opens a
+  WebRTC connection from the browser straight to OpenAI, and streams microphone
+  audio both ways. Safari requires a secure context for getUserMedia, which is
+  the only reason this is hosted rather than opened as a local file.
+
+  WHAT IT DELIBERATELY DOES NOT CONTAIN
+
+  No API key, no long-lived credential, no private data, no analytics, no third
+  party scripts, no storage. The token is pasted at use time, lives in one tab,
+  is cleared from the DOM once the call connects, and expires in about ten
+  minutes. That is what makes it safe for this page to be publicly reachable:
+  there is nothing here worth taking.
+
+  Audio goes browser-to-OpenAI directly. It does not pass through, and this page
+  cannot reach, whatever machine minted the token. No inbound port is involved.
+
+  HONEST LIMIT
+
+  This is a voice model with NO data access - no databases, no files, no memory,
+  no search. It is instructed to refuse figures rather than invent them. It is
+  for conversation and thinking out loud, not for looking anything up.
+
+  Cost discipline is built in rather than advised: a hard session cap and an
+  idle timeout, both enforced in the page, because a realtime socket bills per
+  minute and an idle one bills too.
+-->
+<style>
+  /* Layout: single column, thumb-reachable controls pinned to the bottom.
+     Built for a phone held one-handed in a car, not for a desktop window. */
+  :root {
+    --bg:        #f7f6f3;
+    --surface:   #ffffff;
+    --fg:        #1b1a17;
+    --muted:     #6b675e;
+    --line:      #e2dfd8;
+    --accent:    #1f6f5c;   /* deep green - reads on both grounds */
+    --accent-fg: #ffffff;
+    --live:      #c2410c;
+    --warn:      #8a5a00;
+    --radius:    14px;
+    --font-ui:   system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#14150f; --surface:#1e1f19; --fg:#f0efe8; --muted:#a8a49a;
+      --line:#32332b; --accent:#5ec9a7; --accent-fg:#0b1a15;
+      --live:#ff9d6b; --warn:#e3b23c; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#14150f; --surface:#1e1f19; --fg:#f0efe8; --muted:#a8a49a;
+    --line:#32332b; --accent:#5ec9a7; --accent-fg:#0b1a15;
+    --live:#ff9d6b; --warn:#e3b23c; color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.5 var(--font-ui);
+    padding: env(safe-area-inset-top, 0px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  header { padding-block: 18px 4px; }
+  h1 { margin: 0; font-size: 1.35rem; letter-spacing: -0.01em; text-wrap: balance; }
+  .sub { margin: 4px 0 0; color: var(--muted); font-size: 0.85rem; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px;
+  }
+  label { display: block; font-size: 0.78rem; text-transform: uppercase;
+          letter-spacing: 0.07em; color: var(--muted); margin-bottom: 6px; }
+  input[type=password], input[type=text] {
+    width: 100%; padding: 12px; font: 15px var(--font-mono);
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 10px;
+  }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 0; min-width: 0; }
+
+  button {
+    padding: 15px 16px; font: 600 16px var(--font-ui);
+    border-radius: 12px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--fg); cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+  button.danger  { background: transparent; color: var(--live); border-color: var(--live); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  #status { display: flex; align-items: center; gap: 9px; font-size: 0.92rem; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.live { background: var(--live); animation: pulse 1.4s ease-in-out infinite; }
+  .dot.ok   { background: var(--accent); }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.25 } }
+  @media (prefers-reduced-motion: reduce) { .dot.live { animation: none } }
+
+  #meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  #meterFill { height: 100%; width: 0%; background: var(--accent); transition: width 80ms linear; }
+
+  #log {
+    flex: 1 1 auto; min-height: 120px; overflow-y: auto;
+    font-size: 0.95rem; display: flex; flex-direction: column; gap: 10px;
+  }
+  .turn { padding: 10px 12px; border-radius: 12px; max-width: 92%; }
+  .turn.me  { align-self: flex-end; background: var(--accent); color: var(--accent-fg); }
+  .turn.ajax{ align-self: flex-start; background: var(--surface); border: 1px solid var(--line); }
+  .turn .who { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em;
+               opacity: 0.7; margin-bottom: 3px; }
+
+  .note { font-size: 0.8rem; color: var(--muted); }
+  .note strong { color: var(--warn); }
+  footer { font-size: 0.75rem; color: var(--muted); padding-bottom: 4px; }
+  code { font-family: var(--font-mono); font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Ajax Voice</h1>
+  <p class="sub">Interruptible voice, phone straight to OpenAI. No data access &mdash; no lookups, no figures.</p>
+</header>
+
+<div class="card" id="setup">
+  <label for="tok">Session token (starts <code>ek_</code>, expires ~10 min)</label>
+  <input id="tok" type="password" autocomplete="off" autocapitalize="off"
+         autocorrect="off" spellcheck="false" placeholder="paste the ek_ token">
+  <div class="row" style="margin-top:12px">
+    <button class="primary" id="go">Start talking</button>
+  </div>
+  <p class="note" style="margin-top:10px">
+    Safari will ask for the microphone. The token is used in this tab only and is never stored.
+  </p>
+</div>
+
+<div class="card" id="live" hidden>
+  <div id="status"><span class="dot" id="dot"></span><span id="statusText">connecting&hellip;</span></div>
+  <div id="meter" style="margin-top:10px"><div id="meterFill"></div></div>
+  <div class="row" style="margin-top:12px">
+    <button id="mute">Mute</button>
+    <button class="danger" id="stop">Hang up</button>
+  </div>
+</div>
+
+<div id="log" aria-live="polite"></div>
+
+<footer>
+  Audio never touches the machine that minted the token. Session ends automatically after
+  <span id="capMin">10</span> minutes or 90 seconds idle &mdash; realtime bills per minute of an open socket.
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var MODEL      = "gpt-realtime-2.1";
+  var CAP_MS     = 10 * 60 * 1000;   // hard session cap
+  var IDLE_MS    = 90 * 1000;        // close when nothing is said
+  var CALLS_URL  = "https://api.openai.com/v1/realtime/calls";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var pc = null, mic = null, dc = null, audioEl = null;
+  var capTimer = null, idleTimer = null, meterRaf = null, audioCtx = null;
+  var muted = false;
+
+  $("capMin").textContent = String(CAP_MS / 60000);
+
+  function setStatus(text, cls) {
+    $("statusText").textContent = text;
+    $("dot").className = "dot" + (cls ? " " + cls : "");
+  }
+
+  function addTurn(who, text) {
+    var wrap = document.createElement("div");
+    wrap.className = "turn " + (who === "me" ? "me" : "ajax");
+    var w = document.createElement("div");
+    w.className = "who";
+    w.textContent = who === "me" ? "You" : "Ajax";
+    var b = document.createElement("div");
+    b.textContent = text;
+    wrap.appendChild(w); wrap.appendChild(b);
+    $("log").appendChild(wrap);
+    $("log").scrollTop = $("log").scrollHeight;
+    return b;
+  }
+
+  function note(text) {
+    var p = document.createElement("p");
+    p.className = "note";
+    p.textContent = text;
+    $("log").appendChild(p);
+    $("log").scrollTop = $("log").scrollHeight;
+  }
+
+  function armIdle() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      note("Closed after " + (IDLE_MS / 1000) + "s idle. An open socket bills even in silence.");
+      teardown("idle");
+    }, IDLE_MS);
+  }
+
+  // Level meter: also the honest answer to "is the mic actually working?".
+  // A connected session with a flat meter means Safari gave us a dead track.
+  function startMeter(stream) {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+      var src = audioCtx.createMediaStreamSource(stream);
+      var an = audioCtx.createAnalyser();
+      an.fftSize = 512;
+      src.connect(an);
+      var buf = new Uint8Array(an.frequencyBinCount);
+      var tick = function () {
+        an.getByteFrequencyData(buf);
+        var sum = 0;
+        for (var i = 0; i < buf.length; i++) sum += buf[i];
+        var pct = Math.min(100, (sum / buf.length) * 2.2);
+        $("meterFill").style.width = pct.toFixed(0) + "%";
+        meterRaf = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch (e) { /* a meter is a nicety; never fail the call for it */ }
+  }
+
+  function teardown(why) {
+    if (capTimer) { clearTimeout(capTimer); capTimer = null; }
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (meterRaf) { cancelAnimationFrame(meterRaf); meterRaf = null; }
+    if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+    if (dc) { try { dc.close(); } catch (e) {} dc = null; }
+    if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+    if (mic) { mic.getTracks().forEach(function (t) { t.stop(); }); mic = null; }
+    if (audioEl) { try { audioEl.pause(); } catch (e) {} }
+    $("meterFill").style.width = "0%";
+    setStatus(why === "idle" ? "closed (idle)" : "closed", "");
+    $("live").hidden = true;
+    $("setup").hidden = false;
+    $("go").disabled = false;
+  }
+
+  function wireEvents(channel) {
+    var current = null;   // the element holding Ajax's in-progress transcript
+
+    channel.addEventListener("open", function () {
+      /*
+        The persona, the operator's name and role, and the list of systems this
+        surface cannot reach are all set WHERE THE TOKEN IS MINTED, not here.
+
+        This file is served from a public URL, so anything written into it is
+        public. Naming the operator, their role, or the systems the assistant
+        normally reaches would disclose who uses this page and what it connects
+        to, to anyone who opens it or reads the repository - for no benefit,
+        since the mint step carries the same text privately.
+
+        So the page sends only a surface-level guard rail that is true of this
+        transport regardless of who is using it: no data access, so no figures.
+        If the token arrived with richer instructions, they already apply and are
+        not overwritten - session.update merges rather than replaces.
+      */
+      channel.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          type: "realtime",
+          instructions:
+            "This surface has NO data access: no databases, no files, no memory, no search. " +
+            "Never state a figure, date, name or metric as fact - you cannot look anything up " +
+            "here, and a confident wrong answer is worse than none. Say you cannot check it on " +
+            "this surface and suggest the operator ask where you have your tools. " +
+            "Speak briefly: one or two sentences, answer first, no filler. " +
+            "Reasoning, drafting, wording and talking a problem through are all fair game."
+        }
+      }));
+      setStatus("listening - just talk, you can interrupt", "live");
+      armIdle();
+    });
+
+    channel.addEventListener("message", function (ev) {
+      var m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+
+      if (m.type === "input_audio_buffer.speech_started") {
+        armIdle();
+        setStatus("hearing you", "live");
+      } else if (m.type === "input_audio_buffer.speech_stopped") {
+        setStatus("thinking", "live");
+      } else if (m.type === "conversation.item.input_audio_transcription.completed") {
+        if (m.transcript) addTurn("me", m.transcript);
+      } else if (m.type === "response.output_audio_transcript.delta" ||
+                 m.type === "response.audio_transcript.delta") {
+        if (!current) current = addTurn("ajax", "");
+        current.textContent += (m.delta || "");
+        $("log").scrollTop = $("log").scrollHeight;
+      } else if (m.type === "response.done") {
+        current = null;
+        setStatus("listening - just talk, you can interrupt", "live");
+        armIdle();
+      } else if (m.type === "error") {
+        note("Server error: " + ((m.error && m.error.message) || "unknown"));
+      }
+    });
+  }
+
+  $("go").addEventListener("click", function () {
+    var token = $("tok").value.trim();
+    if (!token) { note("Paste the ek_ token first."); return; }
+    if (token.indexOf("sk-") === 0) {
+      note("That is a long-lived API key, not a session token. Do not paste that here - " +
+           "it would be exposed to this page. Mint a short-lived ek_ token instead.");
+      return;
+    }
+    $("go").disabled = true;
+    $("setup").hidden = true;
+    $("live").hidden = false;
+    setStatus("asking for the microphone", "");
+    start(token);
+  });
+
+  $("stop").addEventListener("click", function () { teardown("user"); });
+
+  $("mute").addEventListener("click", function () {
+    if (!mic) return;
+    muted = !muted;
+    mic.getAudioTracks().forEach(function (t) { t.enabled = !muted; });
+    $("mute").textContent = muted ? "Unmute" : "Mute";
+    setStatus(muted ? "muted" : "listening - just talk, you can interrupt", muted ? "" : "live");
+  });
+
+  function start(token) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      note("This browser exposes no microphone API. Safari needs a secure context (https), " +
+           "which this page has - so if you are seeing this, the browser itself is the problem.");
+      teardown("unsupported");
+      return;
+    }
+
+    navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (stream) {
+      mic = stream;
+      startMeter(stream);
+      setStatus("connecting to OpenAI", "");
+
+      pc = new RTCPeerConnection();
+
+      audioEl = document.createElement("audio");
+      audioEl.autoplay = true;
+      audioEl.playsInline = true;       // iOS refuses inline playback without this
+      document.body.appendChild(audioEl);
+      pc.addEventListener("track", function (ev) {
+        audioEl.srcObject = ev.streams[0];
+        // Safari may still gate playback; a tap already happened, so this works.
+        var p = audioEl.play();
+        if (p && p.catch) p.catch(function () {
+          note("Tap anywhere if you cannot hear the reply - iOS wanted another tap.");
+        });
+      });
+
+      stream.getTracks().forEach(function (t) { pc.addTrack(t, stream); });
+
+      dc = pc.createDataChannel("oai-events");
+      wireEvents(dc);
+
+      pc.addEventListener("connectionstatechange", function () {
+        if (pc && (pc.connectionState === "failed" || pc.connectionState === "disconnected")) {
+          note("Connection " + pc.connectionState + ".");
+          teardown("dropped");
+        }
+      });
+
+      return pc.createOffer().then(function (offer) {
+        return pc.setLocalDescription(offer).then(function () { return offer; });
+      });
+    }).then(function (offer) {
+      if (!offer) return null;
+      return fetch(CALLS_URL + "?model=" + encodeURIComponent(MODEL), {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + $("tok").value.trim(),
+                   "Content-Type": "application/sdp" },
+        body: offer.sdp
+      });
+    }).then(function (res) {
+      if (!res) return null;
+      if (!res.ok) {
+        return res.text().then(function (t) {
+          throw new Error("OpenAI refused the offer (HTTP " + res.status + "). " +
+            (res.status === 401 ? "The token is expired or wrong - mint a fresh one." :
+             t.slice(0, 200)));
+        });
+      }
+      return res.text();
+    }).then(function (answerSdp) {
+      if (!answerSdp) return;
+      return pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    }).then(function () {
+      if (!pc) return;
+      capTimer = setTimeout(function () {
+        note("Hard " + (CAP_MS / 60000) + "-minute cap reached. Closed.");
+        teardown("cap");
+      }, CAP_MS);
+      $("tok").value = "";      // do not keep the token in the DOM
+    }).catch(function (err) {
+      var msg = String((err && err.message) || err);
+      if (/NotAllowedError|Permission|denied/i.test(msg)) {
+        note("Safari blocked the microphone. Settings > Safari > Microphone > Allow, " +
+             "then reload this page and try again.");
+      } else {
+        note(msg);
+      }
+      teardown("error");
+    });
+  }
+
+  window.addEventListener("pagehide", function () { teardown("pagehide"); });
+})();
+</script>
+</body>
+</html>
