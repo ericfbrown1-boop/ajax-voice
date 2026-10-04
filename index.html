@@ -174,6 +174,27 @@
   var CALLS_URL  = "https://api.openai.com/v1/realtime/calls";
 
   var $ = function (id) { return document.getElementById(id); };
+
+  /*
+    Pull the token out of whatever was pasted.
+
+    Eric pasted the entire Telegram message - a title line, the page URL, a
+    "Token (valid ~119 min):" label and then the token - so the Authorization
+    header became "Bearer Ajax Voice (interruptible..." and OpenAI returned 401.
+    Blaming the paste would be the wrong fix: a field that only accepts a
+    surgically-selected substring is a field that will be got wrong again, in a
+    car, one-handed.
+
+    So accept anything that CONTAINS a token and find it. ek_ tokens are
+    url-safe base64, so the character class is unambiguous and the longest match
+    wins in case a label happens to contain the prefix.
+  */
+  function extractToken(raw) {
+    if (!raw) return "";
+    var matches = String(raw).match(/ek_[A-Za-z0-9_\-]{8,}/g);
+    if (!matches || !matches.length) return String(raw).trim();
+    return matches.sort(function (a, b) { return b.length - a.length; })[0];
+  }
   var pc = null, mic = null, dc = null, audioEl = null;
   var capTimer = null, idleTimer = null, meterRaf = null, audioCtx = null;
   var muted = false;
@@ -318,9 +339,11 @@
   }
 
   $("go").addEventListener("click", function () {
-    var token = $("tok").value.trim();
-    if (!token) { note("Paste the ek_ token first."); return; }
-    if (token.indexOf("sk-") === 0) {
+    var token = extractToken($("tok").value);
+    if (!token) { note("Paste the token, or the whole message containing it."); return; }
+    // Normalize the field so the token actually sent is the token shown.
+    $("tok").value = token;
+    if (token.indexOf("sk-") === 0 || /sk-proj-/.test($("tok").value)) {
       note("That is a long-lived API key, not a session token. Do not paste that here - " +
            "it would be exposed to this page. Mint a short-lived ek_ token instead.");
       return;
@@ -391,7 +414,7 @@
       if (!offer) return null;
       return fetch(CALLS_URL + "?model=" + encodeURIComponent(MODEL), {
         method: "POST",
-        headers: { "Authorization": "Bearer " + $("tok").value.trim(),
+        headers: { "Authorization": "Bearer " + extractToken($("tok").value),
                    "Content-Type": "application/sdp" },
         body: offer.sdp
       });
@@ -399,9 +422,16 @@
       if (!res) return null;
       if (!res.ok) {
         return res.text().then(function (t) {
-          throw new Error("OpenAI refused the offer (HTTP " + res.status + "). " +
-            (res.status === 401 ? "The token is expired or wrong - mint a fresh one." :
-             t.slice(0, 200)));
+          if (res.status === 401) {
+            // Verified 2026-10-04: a valid ek_ token on this endpoint returns 400
+            // for a bad offer, never 401. So a 401 here is always the credential,
+            // never the page or the SDP. The usual cause is an older token from a
+            // previous message.
+            throw new Error("That token has expired, or it is an older one. " +
+              "Open the NEWEST voice link and tap Start talking - the newest link " +
+              "fills the token in for you.");
+          }
+          throw new Error("OpenAI refused the offer (HTTP " + res.status + "). " + t.slice(0, 200));
         });
       }
       return res.text();
@@ -426,6 +456,35 @@
       teardown("error");
     });
   }
+
+  /*
+    Accept the token from the URL fragment, so the link itself carries it and
+    there is nothing to paste.
+
+    A fragment is never sent to the server, so the token does not appear in
+    GitHub's request logs or any referrer - it only ever exists in this tab.
+    That makes this strictly safer than pasting, and it removes the failure that
+    actually happened: with two token messages on the phone, the older expired
+    one got pasted and OpenAI returned 401, which reads like a broken page
+    rather than a stale credential.
+
+    The fragment is wiped from the address bar immediately, so the token is not
+    left sitting in history or in anything subsequently shared.
+  */
+  (function hydrateFromLink() {
+    var raw = (window.location.hash || "").replace(/^#/, "").trim();
+    if (!raw) return;
+    try {
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    } catch (e) { /* not fatal; the token is still usable */ }
+    var tok = extractToken(decodeURIComponent(raw));
+    if (tok.indexOf("ek_") !== 0) return;
+    $("tok").value = tok;
+    var p = document.createElement("p");
+    p.className = "note";
+    p.textContent = "Token loaded from your link. Just tap Start talking.";
+    $("setup").appendChild(p);
+  })();
 
   window.addEventListener("pagehide", function () { teardown("pagehide"); });
 })();
