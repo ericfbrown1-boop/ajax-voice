@@ -136,15 +136,22 @@
   <p class="sub">Interruptible voice, phone straight to OpenAI. No data access &mdash; no lookups, no figures.</p>
 </header>
 
+<div class="card" id="preflight">
+  <div id="pfTitle" style="font-weight:600;margin-bottom:8px">Checking this browser&hellip;</div>
+  <div id="pfList" style="font-size:0.88rem;display:flex;flex-direction:column;gap:5px"></div>
+  <p class="note" id="pfFix" hidden style="margin-top:10px"></p>
+</div>
+
 <div class="card" id="setup">
-  <label for="tok">Session token (starts <code>ek_</code>, expires ~10 min)</label>
+  <label for="tok">Session token &mdash; paste anything containing it</label>
   <input id="tok" type="password" autocomplete="off" autocapitalize="off"
          autocorrect="off" spellcheck="false" placeholder="paste the ek_ token">
   <div class="row" style="margin-top:12px">
     <button class="primary" id="go">Start talking</button>
   </div>
   <p class="note" style="margin-top:10px">
-    Safari will ask for the microphone. The token is used in this tab only and is never stored.
+    Safari will ask for the microphone. The token is used in this tab only, is never stored,
+    and is cleared once the call connects.
   </p>
 </div>
 
@@ -160,8 +167,10 @@
 <div id="log" aria-live="polite"></div>
 
 <footer>
-  Audio never touches the machine that minted the token. Session ends automatically after
-  <span id="capMin">10</span> minutes or 90 seconds idle &mdash; realtime bills per minute of an open socket.
+  Audio never touches the machine that minted the token. A call in progress ends after
+  <span id="capMin">30</span> min, or <span id="idleSec">120</span>s of silence &mdash; a realtime
+  socket bills per minute, idle included. That is separate from the token, which only
+  governs how long you have to <em>start</em> a call.
 </footer>
 
 <script>
@@ -169,8 +178,19 @@
   "use strict";
 
   var MODEL      = "gpt-realtime-2.1";
-  var CAP_MS     = 10 * 60 * 1000;   // hard session cap
-  var IDLE_MS    = 90 * 1000;        // close when nothing is said
+  /*
+    Two clocks, and conflating them caused real confusion. The TOKEN expiry
+    (set where the token is minted, up to 2 h) governs how long you have to
+    START a call. CAP_MS is this page's own ceiling on a call already running.
+    The footer used to describe the second and read like the first.
+
+    10 minutes was too short for an actual conversation. 30 is long enough to
+    be useful and still short enough that a forgotten tab cannot run up a bill,
+    which is what the cap is for - a realtime socket bills per minute, idle
+    included, and IDLE_MS closes a silent one well before the cap matters.
+  */
+  var CAP_MS     = 30 * 60 * 1000;
+  var IDLE_MS    = 120 * 1000;
   var CALLS_URL  = "https://api.openai.com/v1/realtime/calls";
 
   var $ = function (id) { return document.getElementById(id); };
@@ -178,12 +198,12 @@
   /*
     Pull the token out of whatever was pasted.
 
-    Eric pasted the entire Telegram message - a title line, the page URL, a
-    "Token (valid ~119 min):" label and then the token - so the Authorization
-    header became "Bearer Ajax Voice (interruptible..." and OpenAI returned 401.
+    In practice people paste the whole message the token arrived in - a title
+    line, a URL, a label, then the token - which put all of that into the
+    Authorization header and produced a 401 that read like a broken page.
     Blaming the paste would be the wrong fix: a field that only accepts a
-    surgically-selected substring is a field that will be got wrong again, in a
-    car, one-handed.
+    surgically-selected substring is a field that gets it wrong again, one
+    handed, while driving.
 
     So accept anything that CONTAINS a token and find it. ek_ tokens are
     url-safe base64, so the character class is unambiguous and the longest match
@@ -200,6 +220,7 @@
   var muted = false;
 
   $("capMin").textContent = String(CAP_MS / 60000);
+  $("idleSec").textContent = String(IDLE_MS / 1000);
 
   function setStatus(text, cls) {
     $("statusText").textContent = text;
@@ -357,12 +378,33 @@
 
   $("stop").addEventListener("click", function () { teardown("user"); });
 
+  /*
+    Mute must never FAIL OPEN. The first version flipped the flag, relabelled the
+    button and called forEach over the track list - so if that list were empty,
+    the button would read "Unmute" while the microphone was still live. A control
+    that says you are muted when you are not is worse than no mute button.
+
+    So: count the tracks actually changed, and only claim the new state if at
+    least one was. Otherwise say plainly that it could not be applied.
+  */
   $("mute").addEventListener("click", function () {
-    if (!mic) return;
-    muted = !muted;
-    mic.getAudioTracks().forEach(function (t) { t.enabled = !muted; });
+    var tracks = mic ? mic.getAudioTracks() : [];
+    if (!tracks.length) {
+      note("Could not change the microphone state - no audio track is attached. " +
+           "Assume the microphone is NOT muted and hang up if that matters.");
+      return;
+    }
+    var want = !muted;
+    var changed = 0;
+    tracks.forEach(function (t) { t.enabled = !want; changed++; });
+    if (!changed) {
+      note("Mute was not applied. Assume the microphone is live.");
+      return;
+    }
+    muted = want;
     $("mute").textContent = muted ? "Unmute" : "Mute";
-    setStatus(muted ? "muted" : "listening - just talk, you can interrupt", muted ? "" : "live");
+    setStatus(muted ? "muted - microphone off" : "listening - just talk, you can interrupt",
+              muted ? "" : "live");
   });
 
   function start(token) {
@@ -471,6 +513,68 @@
     The fragment is wiped from the address bar immediately, so the token is not
     left sitting in history or in anything subsequently shared.
   */
+  /*
+    Self-diagnosis, because the alternative is debugging blind through the person
+    holding the phone.
+
+    "It fails" was all the information available for three rounds. The single
+    most likely cause was never the token: tapping a link inside a messaging app
+    opens that app's OWN in-app browser, not Safari, and getUserMedia is commonly
+    unavailable there. The page can detect that before anything is attempted, and
+    say so, instead of failing at the microphone and looking broken.
+  */
+  function runPreflight() {
+    var ua = navigator.userAgent || "";
+    var checks = [];
+    var fatal = null;
+
+    // An in-app webview is the likeliest cause and the one with a one-tap fix.
+    var inApp = /FBAN|FBAV|Instagram|Line\/|Twitter|WhatsApp|Snapchat|MicroMessenger/i.test(ua) ||
+                (/\bTelegram/i.test(ua)) ||
+                // iOS Safari proper reports "Safari/" and "Version/". A WKWebView
+                // used by another app has the former absent.
+                (/iPhone|iPad/i.test(ua) && !/Safari\//i.test(ua));
+    var secure = (window.isSecureContext === true) || location.protocol === "https:";
+    var hasGUM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    var hasPC  = typeof window.RTCPeerConnection === "function";
+
+    checks.push(["Secure connection (https)", secure]);
+    checks.push(["Microphone API available", hasGUM]);
+    checks.push(["WebRTC available", hasPC]);
+    checks.push(["Running in Safari, not an in-app browser", !inApp]);
+
+    if (!hasGUM || !hasPC) {
+      fatal = inApp
+        ? "This page is open inside another app's browser, which blocks the microphone. " +
+          "Tap the share or ⋯ menu and choose “Open in Safari”, then try again."
+        : "This browser does not expose the microphone or WebRTC. Open the link in Safari.";
+    } else if (inApp) {
+      fatal = "This looks like an in-app browser. The microphone often fails here even " +
+              "when the API exists. If Start talking does nothing, open this link in Safari.";
+    } else if (!secure) {
+      fatal = "This page is not on https, so Safari will refuse the microphone.";
+    }
+
+    var list = $("pfList");
+    checks.forEach(function (c) {
+      var row = document.createElement("div");
+      row.textContent = (c[1] ? "✓  " : "✗  ") + c[0];
+      row.style.color = c[1] ? "var(--muted)" : "var(--live)";
+      list.appendChild(row);
+    });
+
+    var allOk = checks.every(function (c) { return c[1]; });
+    $("pfTitle").textContent = allOk ? "This browser is ready" : "This browser has a problem";
+    if (fatal) { $("pfFix").textContent = fatal; $("pfFix").hidden = false; }
+    // Never hide the setup card on a soft warning: an in-app browser that
+    // happens to work should still be allowed to try.
+    return allOk;
+  }
+  try { runPreflight(); } catch (e) {
+    $("pfTitle").textContent = "Could not check this browser";
+    $("pfList").textContent = String(e);
+  }
+
   (function hydrateFromLink() {
     var raw = (window.location.hash || "").replace(/^#/, "").trim();
     if (!raw) return;
